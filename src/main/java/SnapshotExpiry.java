@@ -6,26 +6,35 @@ import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
 import org.apache.jute.BinaryInputArchive;
 import org.apache.jute.InputArchive;
+import org.apache.zookeeper.server.DataNode;
 import org.apache.zookeeper.server.DataTree;
 import org.apache.zookeeper.server.persistence.FileSnap;
 
 import java.io.BufferedInputStream;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.zip.Adler32;
 import java.util.zip.CheckedInputStream;
 
 public class SnapshotExpiry implements AutoCloseable {
 
   private final String snapshotFileName;
+  private final String znode;
+  private final boolean ctime;
+  private final long expiryDays;
 
-  public SnapshotExpiry(String snapshotFile) {
+  public SnapshotExpiry(String snapshotFile, String znode, boolean ctime, long expiryDays) {
     this.snapshotFileName = snapshotFile;
+    this.znode = znode;
+    this.ctime = ctime;
+    this.expiryDays = expiryDays;
   }
 
   /**
@@ -34,7 +43,13 @@ public class SnapshotExpiry implements AutoCloseable {
   public static void main(String[] args) throws Exception {
     try (final SnapshotExpiry se = parseCommandLine(args)) {
       assert se != null;
+
+      if (se.ctime) {
+        System.out.println("INFO: Using ctime for expiration");
+      }
+
       se.run();
+
 
 
       System.exit(0);
@@ -50,7 +65,7 @@ public class SnapshotExpiry implements AutoCloseable {
     DataTree dataTree = new DataTree();
     Map<Long, Integer> sessions = new HashMap<Long, Integer>();
     fileSnap.deserialize(dataTree, sessions, ia);
-    System.out.println(dataTree.getNodeCount());
+    printZnode(dataTree, znode);
   }
 
   private static SnapshotExpiry parseCommandLine(String[] args) {
@@ -60,6 +75,7 @@ public class SnapshotExpiry implements AutoCloseable {
     options.addRequiredOption(null, "snapshot-file", true, "Snapshot file location. (required)");
     options.addRequiredOption(null, "expiry-days", true, "Znode expiry in days. (required)");
     options.addRequiredOption(null, "server", true, "ZooKeeper server to connect. (required)");
+    options.addRequiredOption(null, "znode", true, "Root znode to scan for expired children. (required)");
 
     options.addOption("h", "help", false, "Print help message");
     options.addOption("c", "ctime", false, "Use ctime to calculate expiration. (default: mtime)");
@@ -71,7 +87,8 @@ public class SnapshotExpiry implements AutoCloseable {
         printHelpAndExit(0, options);
       }
 
-      return new SnapshotExpiry(cli.getOptionValue("snapshot-file"));
+      return new SnapshotExpiry(cli.getOptionValue("snapshot-file"), cli.getOptionValue("znode"),
+          options.hasOption("ctime"), Long.parseLong(cli.getOptionValue("expiry-days")));
     } catch (ParseException e) {
       System.out.printf("%s\n\n", e.getMessage());
       printHelpAndExit(1, options);
@@ -89,4 +106,31 @@ public class SnapshotExpiry implements AutoCloseable {
   public void close() throws Exception {
     // empty
   }
+
+  private void printZnode(DataTree dataTree, String name) {
+    DataNode n = dataTree.getNode(name);
+    Set<String> children;
+    Date now = new Date();
+    Date znodeDate = new Date(ctime ? n.stat.getCtime() : n.stat.getMtime());
+    long age = TimeUnit.DAYS.convert(now.getTime() - znodeDate.getTime(), TimeUnit.MILLISECONDS);
+    if (age > expiryDays) {
+      System.out.printf("Delete: %s - %d days\n", name, age);
+      deleteRecursively(dataTree, name);
+    } else {
+      children = n.getChildren();
+      for (String child : children) {
+        printZnode(dataTree, name + (name.equals("/") ? "" : "/") + child);
+      }
+    }
+  }
+
+  private void deleteRecursively(DataTree dataTree, String node) {
+    DataNode dn = dataTree.getNode(node);
+    Set<String> children = dn.getChildren();
+    for (String child : children) {
+      deleteRecursively(dataTree, node + (node.equals("/") ? "" : "/") + child);
+    }
+    System.out.println("Deleted " + node);  // delete here
+  }
+
 }
