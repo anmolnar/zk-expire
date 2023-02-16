@@ -6,11 +6,16 @@ import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
 import org.apache.jute.BinaryInputArchive;
 import org.apache.jute.InputArchive;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.WatchedEvent;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.server.DataNode;
 import org.apache.zookeeper.server.DataTree;
 import org.apache.zookeeper.server.persistence.FileSnap;
 
 import java.io.BufferedInputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
@@ -19,22 +24,28 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.Adler32;
 import java.util.zip.CheckedInputStream;
 
-public class SnapshotExpiry implements AutoCloseable {
+public class SnapshotExpiry implements AutoCloseable, Watcher {
 
   private final String snapshotFileName;
   private final String znode;
   private final boolean ctime;
   private final long expiryDays;
+  private final String server;
 
-  public SnapshotExpiry(String snapshotFile, String znode, boolean ctime, long expiryDays) {
+  private ZooKeeper zkclient;
+  private final CountDownLatch connectLatch = new CountDownLatch(1);
+
+  public SnapshotExpiry(String snapshotFile, String znode, boolean ctime, long expiryDays, String server) {
     this.snapshotFileName = snapshotFile;
     this.znode = znode;
     this.ctime = ctime;
     this.expiryDays = expiryDays;
+    this.server = server;
   }
 
   /**
@@ -49,14 +60,16 @@ public class SnapshotExpiry implements AutoCloseable {
       }
 
       se.run();
-
-
-
       System.exit(0);
     }
   }
 
-  public void run() throws IOException {
+  public void run() throws IOException, InterruptedException {
+    zkclient = new ZooKeeper(server, 30000, this);
+    if (!connectLatch.await(30L, TimeUnit.SECONDS)) {
+      throw new IOException("Unable to connect to ZooKeeper");
+    }
+    System.out.println("Connected to ZooKeeper instance");
     InputStream is = new CheckedInputStream(
         new BufferedInputStream(Files.newInputStream(Paths.get(snapshotFileName))),
         new Adler32());
@@ -65,7 +78,7 @@ public class SnapshotExpiry implements AutoCloseable {
     DataTree dataTree = new DataTree();
     Map<Long, Integer> sessions = new HashMap<Long, Integer>();
     fileSnap.deserialize(dataTree, sessions, ia);
-    printZnode(dataTree, znode);
+    expireZnode(dataTree, znode);
   }
 
   private static SnapshotExpiry parseCommandLine(String[] args) {
@@ -87,10 +100,15 @@ public class SnapshotExpiry implements AutoCloseable {
         printHelpAndExit(0, options);
       }
 
+      File f = new File(cli.getOptionValue("snapshot-file"));
+      if (!f.exists() || !f.isFile() || !f.canRead()) {
+        throw new ParseException("Unable to open file for reading: " + cli.getOptionValue("snapshot-file"));
+      }
+
       return new SnapshotExpiry(cli.getOptionValue("snapshot-file"), cli.getOptionValue("znode"),
-          options.hasOption("ctime"), Long.parseLong(cli.getOptionValue("expiry-days")));
+          options.hasOption("ctime"), Long.parseLong(cli.getOptionValue("expiry-days")), cli.getOptionValue("server"));
     } catch (ParseException e) {
-      System.out.printf("%s\n\n", e.getMessage());
+      System.out.printf("ERROR: %s\n\n", e.getMessage());
       printHelpAndExit(1, options);
       return null;
     }
@@ -104,33 +122,47 @@ public class SnapshotExpiry implements AutoCloseable {
 
   @Override
   public void close() throws Exception {
-    // empty
+    if (zkclient != null) {
+      zkclient.close();
+      zkclient = null;
+    }
   }
 
-  private void printZnode(DataTree dataTree, String name) {
-    DataNode n = dataTree.getNode(name);
-    Set<String> children;
-    Date now = new Date();
-    Date znodeDate = new Date(ctime ? n.stat.getCtime() : n.stat.getMtime());
-    long age = TimeUnit.DAYS.convert(now.getTime() - znodeDate.getTime(), TimeUnit.MILLISECONDS);
-    if (age > expiryDays) {
-      System.out.printf("Delete: %s - %d days\n", name, age);
-      deleteRecursively(dataTree, name);
-    } else {
-      children = n.getChildren();
-      for (String child : children) {
-        printZnode(dataTree, name + (name.equals("/") ? "" : "/") + child);
+  @Override
+  public void process(WatchedEvent watchedEvent) {
+    if (watchedEvent.getState() == Event.KeeperState.SyncConnected) {
+      connectLatch.countDown();
+    }
+  }
+
+  private void expireZnode(DataTree dataTree, String name) throws InterruptedException {
+    DataNode dn = dataTree.getNode(name);
+    Set<String> children = dn.getChildren();
+    for (String child : children) {
+      String fullPath = name + (name.equals("/") ? "" : "/") + child;
+      DataNode cn = dataTree.getNode(fullPath);
+      Date now = new Date();
+      Date znodeDate = new Date(ctime ? cn.stat.getCtime() : cn.stat.getMtime());
+      long age = TimeUnit.DAYS.convert(now.getTime() - znodeDate.getTime(), TimeUnit.MILLISECONDS);
+      if (age > expiryDays) {
+        deleteRecursively(dataTree, fullPath);
+        System.out.printf("Deleted: %s - %d days\n", fullPath, age);
       }
     }
   }
 
-  private void deleteRecursively(DataTree dataTree, String node) {
+  private void deleteRecursively(DataTree dataTree, String node) throws InterruptedException {
     DataNode dn = dataTree.getNode(node);
     Set<String> children = dn.getChildren();
     for (String child : children) {
       deleteRecursively(dataTree, node + (node.equals("/") ? "" : "/") + child);
     }
-    System.out.println("Deleted " + node);  // delete here
+    try {
+      zkclient.delete(node, dn.stat.getVersion());
+    } catch (KeeperException e) {
+      if (e.code() != KeeperException.Code.NONODE) {
+        System.out.println("Unable to delete: " + node + " - " + e.getMessage());
+      }
+    }
   }
-
 }
