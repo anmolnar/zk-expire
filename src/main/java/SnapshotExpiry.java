@@ -37,18 +37,21 @@ public class SnapshotExpiry implements AutoCloseable, Watcher {
   private final long expiryDays;
   private final String server;
   private final boolean dryRun;
+  private final boolean verbose;
 
   private ZooKeeper zkclient = null;
   private final CountDownLatch connectLatch = new CountDownLatch(1);
   private long deletedZnodes = 0;
+  private long deletedBytes = 0;
 
-  public SnapshotExpiry(String snapshotFile, String znode, boolean ctime, long expiryDays, String server, boolean dryRun) {
+  public SnapshotExpiry(String snapshotFile, String znode, boolean ctime, long expiryDays, String server, boolean dryRun, boolean verbose) {
     this.snapshotFileName = snapshotFile;
     this.znode = znode;
     this.ctime = ctime;
     this.expiryDays = expiryDays;
     this.server = server;
     this.dryRun = dryRun;
+    this.verbose = verbose;
   }
 
   /**
@@ -60,6 +63,8 @@ public class SnapshotExpiry implements AutoCloseable, Watcher {
 
       if (se.ctime) {
         System.out.println("INFO: Using ctime for expiration");
+      } else {
+        System.out.println("INFO: Using mtime for expiration");
       }
       if (se.dryRun) {
         System.out.println("INFO: This is a dry-run, not deleting znodes");
@@ -71,6 +76,22 @@ public class SnapshotExpiry implements AutoCloseable, Watcher {
   }
 
   public void run() throws IOException, InterruptedException {
+    // Load snapshot
+    InputStream is = new CheckedInputStream(
+        new BufferedInputStream(Files.newInputStream(Paths.get(snapshotFileName))),
+        new Adler32());
+    InputArchive ia = BinaryInputArchive.getArchive(is);
+    FileSnap fileSnap = new FileSnap(null);
+    DataTree dataTree = new DataTree();
+    Map<Long, Integer> sessions = new HashMap<Long, Integer>();
+    System.out.println("Loading snapshot from " + snapshotFileName);
+    fileSnap.deserialize(dataTree, sessions, ia);
+    if (dataTree.getNode(znode) == null) {
+      System.err.println("Unable to find znode " + znode + " in the snapshot file.");
+      System.exit(1);
+    }
+
+    // Connect to ZooKeeper
     if (!this.dryRun) {
       zkclient = new ZooKeeper(server, 30000, this);
       if (!connectLatch.await(30L, TimeUnit.SECONDS)) {
@@ -79,14 +100,7 @@ public class SnapshotExpiry implements AutoCloseable, Watcher {
       System.out.println("Connected to ZooKeeper instance");
     }
 
-    InputStream is = new CheckedInputStream(
-        new BufferedInputStream(Files.newInputStream(Paths.get(snapshotFileName))),
-        new Adler32());
-    InputArchive ia = BinaryInputArchive.getArchive(is);
-    FileSnap fileSnap = new FileSnap(null);
-    DataTree dataTree = new DataTree();
-    Map<Long, Integer> sessions = new HashMap<Long, Integer>();
-    fileSnap.deserialize(dataTree, sessions, ia);
+    // Delete znodes
     expireZnode(dataTree, znode);
   }
 
@@ -102,6 +116,7 @@ public class SnapshotExpiry implements AutoCloseable, Watcher {
     options.addOption("h", "help", false, "Print help message");
     options.addOption("c", "ctime", false, "Use ctime to calculate expiration. (default: mtime)");
     options.addOption("n", "dry-run", false, "Don't delete the znodes, just list them.");
+    options.addOption("v", "verbose", false, "Verbose operation. List all znodes being deleted.");
 
     try {
       CommandLine cli = parser.parse(options, args);
@@ -115,8 +130,8 @@ public class SnapshotExpiry implements AutoCloseable, Watcher {
       }
 
       return new SnapshotExpiry(cli.getOptionValue("snapshot-file"), cli.getOptionValue("znode"),
-          options.hasOption("ctime"), Long.parseLong(cli.getOptionValue("expiry-days")), cli.getOptionValue("server"),
-          cli.hasOption("dry-run"));
+          cli.hasOption("ctime"), Long.parseLong(cli.getOptionValue("expiry-days")), cli.getOptionValue("server"),
+          cli.hasOption("dry-run"), cli.hasOption("verbose"));
     } catch (ParseException e) {
       System.out.printf("ERROR: %s\n\n", e.getMessage());
       printHelpAndExit(1, options);
@@ -148,8 +163,20 @@ public class SnapshotExpiry implements AutoCloseable, Watcher {
   private void expireZnode(DataTree dataTree, String name) throws InterruptedException {
     DataNode dn = dataTree.getNode(name);
     Set<String> children = dn.getChildren();
-    System.out.println(name + " has " + children.size() + " children with approx data size: " + dn.getApproximateDataSize());
+    System.out.println(name + " has " + children.size() + " children");
+    long fullSize = children.size();
+    long i = 0;
+    int progress = -1;
     for (String child : children) {
+      ++i;
+      if (!verbose) {
+        int newProgress = Math.round(i * 100f / fullSize);
+        if (progress != newProgress) {
+          progress = newProgress;
+          System.out.printf("Progress: %d %%\r", progress);
+          System.out.flush();
+        }
+      }
       String fullPath = name + (name.equals("/") ? "" : "/") + child;
       DataNode cn = dataTree.getNode(fullPath);
       Date now = new Date();
@@ -157,10 +184,16 @@ public class SnapshotExpiry implements AutoCloseable, Watcher {
       long age = TimeUnit.DAYS.convert(now.getTime() - znodeDate.getTime(), TimeUnit.MILLISECONDS);
       if (age > expiryDays) {
         deleteRecursively(dataTree, fullPath);
-        System.out.printf("Deleted: %s - %d days\n", fullPath, age);
+        if (verbose) {
+          System.out.printf("Deleted: %s - %d days\n", fullPath, age);
+        }
       }
     }
-    System.out.println("Deleted znodes: " + deletedZnodes);
+    if (!verbose) {
+      System.out.print("\n");
+    }
+    System.out.println("Deleted: " + deletedZnodes + " znodes");
+    System.out.println("Size: " + deletedBytes + " bytes");
   }
 
   private void deleteRecursively(DataTree dataTree, String node) throws InterruptedException {
@@ -172,7 +205,11 @@ public class SnapshotExpiry implements AutoCloseable, Watcher {
     try {
       if (!this.dryRun) {
         zkclient.delete(node, dn.stat.getVersion());
+        if (verbose) {
+          System.out.println("Deleted child " + node);
+        }
       }
+      deletedBytes += dn.getApproximateDataSize();
       ++deletedZnodes;
     } catch (KeeperException e) {
       if (e.code() != KeeperException.Code.NONODE) {
