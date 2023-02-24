@@ -1,6 +1,25 @@
 # zk-expire
 
-Delete expired znodes in ZooKeeper database based on Snapshot file.
+The problem with deleting large number of znodes from a ZooKeeper database is usually
+related to the getChildren() call. The results cannot be paged, so if a znode has lots 
+of children, the response cannot be sent over the network. Increasing jute.maxbuffer could
+resolve the problem, but it's only a temporary solution and the side effects could be a 
+serious problem and unacceptable in a production system.
+
+This tool loads a snapshot file to make a list of child znodes and connects to a ZooKeeper
+instance to delete them one by one. It requires the most up-to-date snapshot for reading
+locally, but don't need to run on each ZooKeeper node, since it deletes znodes via standard
+ZooKeeper Api.
+
+No need for shutting down the ZooKeeper ensemble or a node, but the latest snapshot file
+could be slightly outdated, since this tool doesn't read transaction logs to build the Data Tree.
+This is okay as long as we use it for "expiring nodes": 6-7 days old znodes are probably 
+already snapshotted, but still there's a possibility for working with an outdated snapshot.
+The tool will silently skip non-existent znodes.
+
+There's one limitation: the tool declines to work on the root "/" znode, because it could 
+potentially  destroy the entire ZK database, so it's disallowed. Please choose a specific 
+znode.
 
 ## Build
 

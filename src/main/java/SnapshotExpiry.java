@@ -59,8 +59,6 @@ public class SnapshotExpiry implements AutoCloseable, Watcher {
    */
   public static void main(String[] args) throws Exception {
     try (final SnapshotExpiry se = parseCommandLine(args)) {
-      assert se != null;
-
       if (se.ctime) {
         System.out.println("INFO: Using ctime for expiration");
       } else {
@@ -71,7 +69,8 @@ public class SnapshotExpiry implements AutoCloseable, Watcher {
       }
 
       se.run();
-      System.exit(0);
+    } catch (ParseException e) {
+      System.out.printf("ERROR: %s\n", e.getMessage());
     }
   }
 
@@ -104,7 +103,7 @@ public class SnapshotExpiry implements AutoCloseable, Watcher {
     expireZnode(dataTree, znode);
   }
 
-  private static SnapshotExpiry parseCommandLine(String[] args) {
+  private static SnapshotExpiry parseCommandLine(String[] args) throws ParseException {
     CommandLineParser parser = new DefaultParser();
     Options options = new Options();
 
@@ -118,25 +117,23 @@ public class SnapshotExpiry implements AutoCloseable, Watcher {
     options.addOption("n", "dry-run", false, "Don't delete the znodes, just list them.");
     options.addOption("v", "verbose", false, "Verbose operation. List all znodes being deleted.");
 
-    try {
-      CommandLine cli = parser.parse(options, args);
-      if (cli.hasOption("help")) {
-        printHelpAndExit(0, options);
-      }
-
-      File f = new File(cli.getOptionValue("snapshot-file"));
-      if (!f.exists() || !f.isFile() || !f.canRead()) {
-        throw new ParseException("Unable to open file for reading: " + cli.getOptionValue("snapshot-file"));
-      }
-
-      return new SnapshotExpiry(cli.getOptionValue("snapshot-file"), cli.getOptionValue("znode"),
-          cli.hasOption("ctime"), Long.parseLong(cli.getOptionValue("expiry-days")), cli.getOptionValue("server"),
-          cli.hasOption("dry-run"), cli.hasOption("verbose"));
-    } catch (ParseException e) {
-      System.out.printf("ERROR: %s\n\n", e.getMessage());
-      printHelpAndExit(1, options);
-      return null;
+    CommandLine cli = parser.parse(options, args);
+    if (cli.hasOption("help")) {
+      printHelpAndExit(0, options);
     }
+
+    if ("/".equals(cli.getOptionValue("znode"))) {
+      throw new ParseException("Wiping the root znode is prohibited, because it could seriously harm ZooKeeper db. Please choose a specific znode.");
+    }
+
+    File f = new File(cli.getOptionValue("snapshot-file"));
+    if (!f.exists() || !f.isFile() || !f.canRead()) {
+      throw new ParseException("Unable to open file for reading: " + cli.getOptionValue("snapshot-file"));
+    }
+
+    return new SnapshotExpiry(cli.getOptionValue("snapshot-file"), cli.getOptionValue("znode"),
+        cli.hasOption("ctime"), Long.parseLong(cli.getOptionValue("expiry-days")), cli.getOptionValue("server"),
+        cli.hasOption("dry-run"), cli.hasOption("verbose"));
   }
 
   private static void printHelpAndExit(int exitCode, Options options) {
